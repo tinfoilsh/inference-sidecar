@@ -29,7 +29,7 @@ func startProxy(t *testing.T, upstream http.Handler) *httptest.Server {
 		t.Fatalf("cannot parse upstream URL: %v", err)
 	}
 
-	proxy := httptest.NewServer(newHandler(target))
+	proxy := httptest.NewServer(newHandler(target, true))
 	t.Cleanup(proxy.Close)
 	return proxy
 }
