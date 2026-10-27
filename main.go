@@ -22,6 +22,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 )
 
 const (
@@ -47,44 +48,109 @@ var (
 func main() {
 	log.SetFlags(0)
 	log.SetPrefix("inference-sidecar: ")
-
-	child := os.Args[1:]
-	if len(child) == 0 {
-		log.Fatal("no upstream command given")
-	}
-
-	upstreamPort := env("SIDECAR_UPSTREAM_PORT", defaultUpstreamPort)
-	listenPort := env("SIDECAR_LISTEN", lastPortFlag(child, defaultListenPort))
-	child = upstreamCommand(child, upstreamPort)
-
-	cmd := exec.Command(child[0], child[1:]...)
-	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
-	if err := cmd.Start(); err != nil {
-		log.Fatalf("cannot start %s: %v", child[0], err)
-	}
-
-	signals := make(chan os.Signal, 1)
-	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
-	go func() {
-		for received := range signals {
-			if err := cmd.Process.Signal(received); err != nil {
-				log.Printf("cannot relay %s: %v", received, err)
-			}
-		}
-	}()
-
-	go serve(listenPort, upstreamPort)
-
-	if err := cmd.Wait(); cmd.ProcessState == nil {
-		log.Fatalf("cannot wait for %s: %v", child[0], err)
-	}
-	os.Exit(exitCode(cmd.ProcessState))
+	os.Exit(run())
 }
 
-func serve(listenPort, upstreamPort string) {
+func run() int {
+	if len(os.Args) == 2 && os.Args[1] == "--check-policy-version=1" {
+		fmt.Println("1")
+		return 0
+	}
+	policy, err := parsePolicy(os.Getenv("SIDECAR_POLICY"), os.Getenv("DOMAIN"))
+	if err != nil {
+		log.Print(err)
+		return 1
+	}
+	child := os.Args[1:]
+	// A measured entrypoint uses this guard so a pre-policy sidecar fails to
+	// start instead of silently ignoring the new environment configuration.
+	if len(child) > 0 && strings.HasPrefix(child[0], "--policy-version=") {
+		if child[0] != "--policy-version=1" {
+			log.Print("unsupported policy version")
+			return 1
+		}
+		child = child[1:]
+	}
+	upstreamPort := env("SIDECAR_UPSTREAM_PORT", defaultUpstreamPort)
+	listenPort := env("SIDECAR_LISTEN", lastPortFlag(child, defaultListenPort))
 	upstream := &url.URL{Scheme: "http", Host: net.JoinHostPort(upstreamHost, upstreamPort)}
-	err := http.ListenAndServe(net.JoinHostPort("", listenPort), newHandler(upstream))
-	log.Fatalf("listener stopped: %v", err)
+	if explicit := os.Getenv("SIDECAR_UPSTREAM_URL"); explicit != "" {
+		upstream, err = url.Parse(explicit)
+		if err != nil || upstream.Scheme != "http" || upstream.User != nil || upstream.RawQuery != "" || upstream.Fragment != "" || (upstream.Path != "" && upstream.Path != "/") || !net.ParseIP(upstream.Hostname()).IsLoopback() || upstream.Port() == "" {
+			log.Print("SIDECAR_UPSTREAM_URL must be an HTTP loopback address with an explicit port")
+			return 1
+		}
+	} else {
+		if len(child) == 0 {
+			log.Print("no upstream command or SIDECAR_UPSTREAM_URL given")
+			return 1
+		}
+		child = upstreamCommand(child, upstreamPort)
+	}
+	validator, limiter, err := policy.validators()
+	if err != nil {
+		log.Print(err)
+		return 1
+	}
+	listener, err := net.Listen("tcp", net.JoinHostPort("", listenPort))
+	if err != nil {
+		log.Printf("cannot listen: %v", err)
+		return 1
+	}
+	defer listener.Close()
+	handler := withPolicy(policy, os.Getenv("DOMAIN"), validator, limiter, newHandler(upstream, os.Getenv("SIDECAR_UPSTREAM_URL") == ""))
+	var active sync.WaitGroup
+	server := &http.Server{
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			active.Add(1)
+			defer active.Done()
+			handler.ServeHTTP(w, r)
+		}),
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       2 * time.Minute,
+	}
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(signals)
+	var cmd *exec.Cmd
+	childDone := make(chan error, 1)
+	if len(child) > 0 {
+		cmd = exec.Command(child[0], child[1:]...)
+		cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+		if err := cmd.Start(); err != nil {
+			log.Printf("cannot start %s: %v", child[0], err)
+			return 1
+		}
+		go func() { childDone <- cmd.Wait() }()
+	}
+	served := make(chan error, 1)
+	go func() { served <- server.Serve(listener) }()
+	select {
+	case err := <-childDone:
+		server.Close()
+		if cmd.ProcessState == nil {
+			log.Printf("cannot wait for child: %v", err)
+			return 1
+		}
+		return exitCode(cmd.ProcessState)
+	case received := <-signals:
+		// Keep the existing upstream alive until in-flight responses drain.
+		_ = server.Shutdown(context.Background())
+		active.Wait()
+		if cmd != nil {
+			_ = cmd.Process.Signal(received)
+			<-childDone
+			return exitCode(cmd.ProcessState)
+		}
+		return 0
+	case err := <-served:
+		log.Printf("listener stopped: %v", err)
+		if cmd != nil {
+			_ = cmd.Process.Signal(syscall.SIGTERM)
+			<-childDone
+		}
+		return 1
+	}
 }
 
 func env(name, fallback string) string {
@@ -118,16 +184,32 @@ func exitCode(state *os.ProcessState) int {
 	return state.ExitCode()
 }
 
-func newHandler(upstream *url.URL) http.Handler {
+// Explicit upstream mode is transparent: MCP, document uploads, routers and
+// WebSockets retain their own response formats and body admission behavior.
+func newHandler(upstream *url.URL, inference bool) http.Handler {
 	proxy := &httputil.ReverseProxy{
 		Rewrite: func(request *httputil.ProxyRequest) {
 			request.SetURL(upstream)
 			request.Out.Host = request.In.Host
+			request.Out.Header.Set("X-Forwarded-Host", request.In.Host)
 		},
-		FlushInterval:  -1,
-		ModifyResponse: modifyResponse,
+		FlushInterval: -1,
+		ModifyResponse: func(response *http.Response) error {
+			response.Header.Del("Access-Control-Allow-Origin")
+			if inference {
+				return modifyResponse(response)
+			}
+			return nil
+		},
+		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+			log.Printf("proxy error: %v", err)
+			writeAPIError(w, errUpstreamUnreachable)
+		},
 	}
-	return withUsageIntent(proxy)
+	if inference {
+		return withUsageIntent(proxy)
+	}
+	return proxy
 }
 
 type usageIntentKey struct{}
