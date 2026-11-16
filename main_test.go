@@ -18,7 +18,9 @@ const (
 	expectedUsage = "prompt=11,completion=3,total=14,cached_prompt_tokens=5,uncached_prompt_tokens=6"
 )
 
-func startProxy(t *testing.T, upstream http.Handler) *httptest.Server {
+// startProxy runs the proxy with only the given rules enabled; none, as in
+// production when SIDECAR_QUIRKS is unset, unless a test opts in.
+func startProxy(t *testing.T, upstream http.Handler, rules ...quirk) *httptest.Server {
 	t.Helper()
 
 	origin := httptest.NewServer(upstream)
@@ -29,7 +31,7 @@ func startProxy(t *testing.T, upstream http.Handler) *httptest.Server {
 		t.Fatalf("cannot parse upstream URL: %v", err)
 	}
 
-	proxy := httptest.NewServer(newHandler(target))
+	proxy := httptest.NewServer(newHandler(target, rules))
 	t.Cleanup(proxy.Close)
 	return proxy
 }

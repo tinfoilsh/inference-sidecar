@@ -31,6 +31,7 @@ const (
 	defaultUpstreamPort = "18001"
 	defaultListenPort   = "8000"
 	maxBufferBytes      = 8 << 20
+	maxRequestBytes     = 64 << 20 // largest body the quirks rewrite; larger ones pass through
 	maxEventBytes       = 4 << 20
 	initialEventBytes   = 64 << 10
 	paddingCharset      = "abcdefghijklmnopqrstuvwxyz0123456789"
@@ -55,6 +56,11 @@ func main() {
 
 	upstreamPort := env("SIDECAR_UPSTREAM_PORT", defaultUpstreamPort)
 	listenPort := env("SIDECAR_LISTEN", lastPortFlag(child, defaultListenPort))
+	rules, err := selectQuirks(os.Getenv("SIDECAR_QUIRKS"))
+	if err != nil {
+		log.Fatalf("SIDECAR_QUIRKS: %v", err)
+	}
+	log.Printf("quirks enabled: %s", quirkNames(rules))
 	child = upstreamCommand(child, upstreamPort)
 
 	cmd := exec.Command(child[0], child[1:]...)
@@ -73,7 +79,7 @@ func main() {
 		}
 	}()
 
-	go serve(listenPort, upstreamPort)
+	go serve(listenPort, upstreamPort, rules)
 
 	if err := cmd.Wait(); cmd.ProcessState == nil {
 		log.Fatalf("cannot wait for %s: %v", child[0], err)
@@ -81,9 +87,9 @@ func main() {
 	os.Exit(exitCode(cmd.ProcessState))
 }
 
-func serve(listenPort, upstreamPort string) {
+func serve(listenPort, upstreamPort string, rules []quirk) {
 	upstream := &url.URL{Scheme: "http", Host: net.JoinHostPort(upstreamHost, upstreamPort)}
-	err := http.ListenAndServe(net.JoinHostPort("", listenPort), newHandler(upstream))
+	err := http.ListenAndServe(net.JoinHostPort("", listenPort), newHandler(upstream, rules))
 	log.Fatalf("listener stopped: %v", err)
 }
 
@@ -118,7 +124,7 @@ func exitCode(state *os.ProcessState) int {
 	return state.ExitCode()
 }
 
-func newHandler(upstream *url.URL) http.Handler {
+func newHandler(upstream *url.URL, rules []quirk) http.Handler {
 	proxy := &httputil.ReverseProxy{
 		Rewrite: func(request *httputil.ProxyRequest) {
 			request.SetURL(upstream)
@@ -127,7 +133,7 @@ func newHandler(upstream *url.URL) http.Handler {
 		FlushInterval:  -1,
 		ModifyResponse: modifyResponse,
 	}
-	return withUsageIntent(proxy)
+	return withRequestBody(proxy, rules)
 }
 
 type usageIntentKey struct{}
@@ -137,26 +143,56 @@ type requestBody struct {
 	io.Closer
 }
 
-func withUsageIntent(next http.Handler) http.Handler {
+// withRequestBody reads the head of each POST body to record whether the
+// caller asked for the usage chunk, so modifyResponse can drop it otherwise.
+// When an enabled rule claims the path it reads the whole body instead and
+// applies the compatibility rules to it. A body over maxRequestBytes is
+// forwarded intact and unrewritten, exactly as it arrived.
+func withRequestBody(next http.Handler, rules []quirk) http.Handler {
 	return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		if request.Method != http.MethodPost {
 			next.ServeHTTP(writer, request)
 			return
 		}
 
-		head, err := io.ReadAll(io.LimitReader(request.Body, maxBufferBytes))
+		rewrite := claimsPath(rules, request.URL.Path) && isJSONContentType(request.Header.Get("Content-Type"))
+		limit := int64(maxBufferBytes)
+		if rewrite {
+			// One byte past the cap, so an unset Content-Length is still caught.
+			limit = maxRequestBytes + 1
+		}
+		head, err := io.ReadAll(io.LimitReader(request.Body, limit))
 		if err != nil {
 			http.Error(writer, "cannot read request body", http.StatusBadRequest)
 			return
 		}
-		request.Body = &requestBody{
-			Reader: io.MultiReader(bytes.NewReader(head), request.Body),
-			Closer: request.Body,
+
+		if !rewrite || len(head) > maxRequestBytes {
+			request.Body = &requestBody{
+				Reader: io.MultiReader(bytes.NewReader(head), request.Body),
+				Closer: request.Body,
+			}
+		} else if body, count := rewriteRequestBody(request.URL.Path, head, rules); count > 0 {
+			request.Body = &requestBody{Reader: bytes.NewReader(body), Closer: request.Body}
+			request.ContentLength = int64(len(body))
+			// The inbound header would otherwise advertise the pre-rewrite length.
+			request.Header.Del("Content-Length")
+		} else {
+			request.Body = &requestBody{Reader: bytes.NewReader(head), Closer: request.Body}
 		}
 
 		intent := context.WithValue(request.Context(), usageIntentKey{}, askedForUsageChunk(head))
 		next.ServeHTTP(writer, request.WithContext(intent))
 	})
+}
+
+// isJSONContentType treats a missing Content-Type as JSON, as vLLM does.
+func isJSONContentType(contentType string) bool {
+	if contentType == "" {
+		return true
+	}
+	mediaType, _, err := mime.ParseMediaType(contentType)
+	return err == nil && mediaType == "application/json"
 }
 
 func askedForUsageChunk(body []byte) bool {
